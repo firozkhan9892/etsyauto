@@ -104,15 +104,20 @@ Given a single topic keyword, produce a complete Etsy listing draft as JSON.
 Rules:
 - title: under 140 characters, leading with the highest-intent keyword,
   secondary keywords separated by commas.
-- tags: EXACTLY 13 tags, each under 20 characters, lowercase, unique, no
-  special characters.
+- tags: EXACTLY 13 tags, each under 20 characters, lowercase, unique.
+  Use natural phrases with spaces between words (e.g. "digital planner"),
+  no punctuation or symbols.
 - description: Markdown. Sections: ## What You Get, ## How to Download,
-  ## Disclaimer. The Disclaimer MUST include the phrase "AI-assisted design".
-  Keep 300-600 words.
+  ## Disclaimer. The ## Disclaimer section MUST contain the exact phrase
+  "AI-assisted design" (e.g. "This product was created with AI-assisted
+  design."). Keep 300-600 words.
 - suggested_price: a realistic USD float (e.g. 4.99).
 - content_outline: a structured JSON object (titles, headers, bullet items,
   and text) describing the actual digital product so it can be built.
-- Return ONLY valid JSON. No markdown fences, no commentary.
+- CRITICAL: output is a product listing, not a chat message. NEVER include
+  greetings, sign-offs, or assistant commentary such as "I'm happy to help",
+  "Here is your listing", or any conversational filler in any field.
+- Return ONLY the JSON object. No markdown fences, no labels, no commentary.
 """
 
 
@@ -121,7 +126,13 @@ def _build_user_prompt(topic_keyword: str) -> str:
         f"Create a full Etsy listing draft for this digital product topic: "
         f"'{topic_keyword}'.\n\n"
         "Think step-by-step about buyer intent, pricing, and SEO before "
-        "returning the final JSON."
+        "returning the final JSON.\n\n"
+        "REMINDERS:\n"
+        "- The description MUST contain a '## Disclaimer' section that "
+        "includes the exact phrase 'AI-assisted design'.\n"
+        "- Output ONLY valid JSON: keys are title, tags, description, "
+        "suggested_price, content_outline.\n"
+        "- No greetings or sign-offs anywhere."
     )
 
 
@@ -189,9 +200,11 @@ def generate_etsy_listing_data(topic_keyword: str) -> dict[str, Any]:
     if settings.groq_api_key:
         try:
             client = _new_groq_client()
-            raw = _call_groq(client, system, user)
-            logger.info("Groq generation succeeded for '%s'.", topic_keyword)
-            return _validate(raw, topic_keyword, "Groq")
+            return _generate_with_retries(
+                topic_keyword,
+                lambda: _call_groq(client, system, user),
+                "Groq",
+            )
         except Exception as exc:
             last_exc = exc
             logger.warning("Groq failed (%s); falling back to NVIDIA.", exc)
@@ -202,9 +215,11 @@ def generate_etsy_listing_data(topic_keyword: str) -> dict[str, Any]:
     if settings.nvidia_api_key:
         try:
             client = _new_nvidia_client()
-            raw = _call_nvidia(client, system, user)
-            logger.info("NVIDIA NIM generation succeeded for '%s'.", topic_keyword)
-            return _validate(raw, topic_keyword, "NVIDIA")
+            return _generate_with_retries(
+                topic_keyword,
+                lambda: _call_nvidia(client, system, user),
+                "NVIDIA",
+            )
         except Exception as exc:
             last_exc = exc
             logger.error("NVIDIA NIM fallback also failed: %s", exc)
@@ -216,12 +231,37 @@ def generate_etsy_listing_data(topic_keyword: str) -> dict[str, Any]:
     ) from last_exc
 
 
-def _validate(raw: str, topic: str, provider: str) -> dict[str, Any]:
-    """Strip code fences, parse JSON, and validate against the schema.
+def _generate_with_retries(
+    topic: str,
+    call_fn: Any,
+    provider: str,
+) -> dict[str, Any]:
+    """Call the provider afresh on each attempt and validate each response.
 
-    Re-tries validation failures up to _MAX_RETRIES (the model sometimes
-    returns malformed JSON).
+    Unlike re-parsing the same text, a fresh call lets the model correct a
+    schema violation (e.g. a missing disclaimer) on the next attempt.
     """
+    last_exc: Exception | None = None
+    for attempt in range(1, _MAX_RETRIES + 1):
+        try:
+            raw = call_fn()
+            return _validate(raw, topic, provider)
+        except Exception as exc:
+            last_exc = exc
+            logger.warning(
+                "%s attempt %d/%d failed for '%s': %s",
+                provider, attempt, _MAX_RETRIES, topic, exc,
+            )
+            if attempt < _MAX_RETRIES:
+                time.sleep(_BACKOFF_BASE ** attempt)
+
+    raise ValueError(
+        f"Provider '{provider}' failed after {_MAX_RETRIES} attempts."
+    ) from last_exc
+
+
+def _validate(raw: str, topic: str, provider: str) -> dict[str, Any]:
+    """Strip code fences, parse JSON, and validate against the schema."""
     text = raw.strip()
     if text.startswith("```"):
         lines = text.splitlines()
@@ -231,23 +271,7 @@ def _validate(raw: str, topic: str, provider: str) -> dict[str, Any]:
             lines = lines[:-1]
         text = "\n".join(lines).strip()
 
-    last_exc: Exception | None = None
-    for attempt in range(1, _MAX_RETRIES + 1):
-        try:
-            data = json.loads(text)
-            listing = EtsyListingData.model_validate(data)
-            logger.info("Validated %s output for '%s' (attempt %d).", provider, topic, attempt)
-            return listing.model_dump()
-        except Exception as exc:
-            last_exc = exc
-            logger.warning(
-                "Validation attempt %d/%d failed for %s: %s",
-                attempt, _MAX_RETRIES, provider, exc,
-            )
-            if attempt < _MAX_RETRIES:
-                time.sleep(_BACKOFF_BASE ** attempt)
-
-    raise ValueError(
-        f"Provider '{provider}' returned invalid/unparseable JSON after "
-        f"{_MAX_RETRIES} attempts."
-    ) from last_exc
+    data = json.loads(text)
+    listing = EtsyListingData.model_validate(data)
+    logger.info("Validated %s output for '%s'.", provider, topic)
+    return listing.model_dump()
