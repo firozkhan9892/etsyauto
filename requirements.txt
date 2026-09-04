@@ -1,0 +1,9 @@
+groq>=0.9.0
+openai>=1.30.0
+requests>=2.31.0
+Pillow>=10.0.0
+reportlab>=4.0.0
+pytrends>=4.9.2
+python-dotenv>=1.0.0
+pydantic>=2.0.0
+schedule>=1.2.0
