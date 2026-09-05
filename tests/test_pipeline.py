@@ -389,6 +389,80 @@ class PipelineDryRunTests(unittest.TestCase):
         self.assertIsNone(result["listing_id"])
         self.assertIsNone(result["review_url"])
 
+    def test_live_mode_falls_back_to_dry_run_when_credentials_invalid(self) -> None:
+        """Valid-looking creds that fail a live check must NOT crash or upload."""
+        import src.config as cfg
+        import main as pipeline
+
+        cfg._settings = None  # rebuild Settings from the patched env
+
+        with patch.object(
+            pipeline, "fetch_rising_trends",
+            return_value=[{"keyword": "digital planner", "breakout": 1000}],
+        ), patch.object(
+            pipeline, "fetch_etsy_autocomplete",
+            return_value=["digital planner pdf"],
+        ), patch.object(
+            pipeline, "generate_etsy_listing_data",
+            return_value=_valid_listing(),
+        ), patch.object(
+            pipeline.EtsyClient, "verify_credentials", return_value=False
+        ) as mock_verify, patch.object(
+            pipeline.EtsyClient, "create_draft_listing"
+        ) as mock_create, patch.object(
+            pipeline.EtsyClient, "upload_listing_image"
+        ) as mock_img, patch.object(
+            pipeline.EtsyClient, "upload_digital_file"
+        ) as mock_file, patch.object(
+            pipeline, "log_listing"
+        ) as mock_log:
+            result = pipeline.run(seed="planner", dry_run=False, output_dir=str(self.tmp_path))
+
+        # Live validation ran, uploads never happened, result is dry-run style.
+        mock_verify.assert_called_once()
+        mock_create.assert_not_called()
+        mock_img.assert_not_called()
+        mock_file.assert_not_called()
+        mock_log.assert_not_called()
+        self.assertIsNone(result["listing_id"])
+        self.assertIsNone(result["review_url"])
+        self.assertTrue(Path(result["pdf_path"]).exists())
+
+
+class EtsyCredentialVerificationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        import src.config as cfg
+
+        cfg._settings = None  # rebuild Settings from the freshly patched env
+        self.env = patch.dict(os.environ, DUMMY_ENV)
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        self.client = EtsyClient()
+
+    def test_verify_credentials_true_when_shop_responds(self) -> None:
+        with patch.object(EtsyClient, "_request", return_value={"shop_id": 12345}):
+            self.assertTrue(self.client.verify_credentials())
+
+    def test_verify_credentials_false_when_api_rejects(self) -> None:
+        from src.etsy_client import EtsyAPIError
+
+        with patch.object(
+            EtsyClient, "_request", side_effect=EtsyAPIError(401, "Authentication failed")
+        ):
+            self.assertFalse(self.client.verify_credentials())
+
+    def test_verify_credentials_false_when_missing(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"ETSY_KEYSTRING": "", "ETSY_ACCESS_TOKEN": "", "ETSY_SHOP_ID": ""},
+            clear=True,
+        ):
+            import src.config as cfg
+
+            cfg._settings = None
+            client = EtsyClient()
+            self.assertFalse(client.verify_credentials())
+
 
 class ValidateCredentialsTests(unittest.TestCase):
     def _reset_settings(self) -> None:

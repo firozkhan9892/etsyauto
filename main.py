@@ -270,16 +270,29 @@ def run(
         parsed_args.dry_run if parsed_args is not None else False
     )
     should_upload = (not is_dry) and validate_etsy_credentials()
+    validation_failed = False
+
+    # Credentials being *present* is not enough: probe the API so a stale
+    # token or a placeholder/invalid shop id degrades to dry-run instead of
+    # crashing the scheduler run.
+    if should_upload:
+        client = EtsyClient()
+        if not client.verify_credentials():
+            should_upload = False
+            validation_failed = True
 
     if not should_upload:
-        print("\n[DRY RUN] Etsy API skipped; assets generated locally.")
+        print(
+            "\n[DRY RUN] Etsy API skipped"
+            + ("; credentials failed validation" if validation_failed else "")
+            + "; assets generated locally."
+        )
         _print_summary({**base, "tags_count": len(listing["tags"]), "dry_run": True})
         _emit_result(base)
         return base
 
     # 6. Upload as a DRAFT (mockup + product file), never publish.
     print("[5/5] Creating Etsy draft listing and uploading assets...")
-    client = EtsyClient()
     client.require_credentials()
 
     taxonomy_id = parsed_args.taxonomy_id if parsed_args else 2047

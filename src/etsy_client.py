@@ -81,6 +81,28 @@ class EtsyClient:
                 "to obtain ETSY_ACCESS_TOKEN)."
             )
 
+    def verify_credentials(self) -> bool:
+        """Live-check that the token and shop id actually work on the API.
+
+        Issues a lightweight ``GET /shops/{shop_id}`` (needs the ``shops_r``
+        scope). Returns ``True`` on success; any failure -- a 401/403 token
+        problem, a 404 for an invalid/placeholder shop id, or a network error
+        -- is treated as "not usable right now" and returns ``False`` so
+        callers can stay in local/dry-run mode instead of crashing.
+        """
+        try:
+            self.require_credentials()
+            self._request(
+                "GET", f"/shops/{self._s.etsy_shop_id}", timeout=20, log_errors=False
+            )
+            return True
+        except (EtsyAPIError, MissingCredentialsError) as exc:
+            logger.warning(
+                "Etsy credential check failed (%s); staying in local/dry-run mode.",
+                exc,
+            )
+            return False
+
     # -- Request plumbing ----------------------------------------------------
 
     def _headers(self, *, json: bool) -> dict[str, str]:
@@ -101,6 +123,7 @@ class EtsyClient:
         data: dict | None = None,
         files: dict | None = None,
         timeout: int = 60,
+        log_errors: bool = True,
     ) -> dict:
         url = f"{self._s.etsy_base_url}/{path.lstrip('/')}"
         is_json = json_body is not None
@@ -133,9 +156,8 @@ class EtsyClient:
                 message = str(message)
             except ValueError:
                 message = body or resp.reason
-            logger.error(
-                "Etsy API %s -> %s (%s): %s", method, url, resp.status_code, message
-            )
+            log = logger.error if log_errors else logger.debug
+            log("Etsy API %s -> %s (%s): %s", method, url, resp.status_code, message)
             raise EtsyAPIError(
                 resp.status_code, message, endpoint=url, response_body=body
             )
