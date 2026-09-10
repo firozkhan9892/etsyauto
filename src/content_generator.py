@@ -36,6 +36,21 @@ _MAX_RETRIES = 3
 _BACKOFF_BASE = 2.0
 
 
+def _truncate_at_word(tag: str, limit: int = 20) -> str:
+    """Shorten *tag* to at most ``limit`` characters without cutting mid-word.
+
+    Prefers the longest whole-word prefix that fits the limit. Only if the
+    first word alone exceeds the limit is a hard (mid-word) cut applied,
+    since it cannot be avoided.
+    """
+    if len(tag) <= limit:
+        return tag
+    cut = tag.rfind(" ", 0, limit)
+    if cut > 0:
+        return tag[:cut].rstrip()
+    return tag[:limit]
+
+
 # ---------------------------------------------------------------------------
 # Pydantic schema – enforces the strict JSON contract
 # ---------------------------------------------------------------------------
@@ -75,10 +90,9 @@ class EtsyListingData(BaseModel):
     def _tags_valid(cls, v: list[str]) -> list[str]:
         cleaned: list[str] = []
         for tag in v:
-            t = tag.strip().lower()
-            if len(t) > 20:
-                raise ValueError(f"Tag '{t}' is {len(t)} chars, max 20 allowed.")
-            if t not in cleaned:
+            t = " ".join(tag.strip().lower().split())
+            t = _truncate_at_word(t)
+            if t and t not in cleaned:
                 cleaned.append(t)
         if len(cleaned) != 13:
             raise ValueError(f"Tags must be exactly 13 unique, got {len(cleaned)}.")

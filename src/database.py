@@ -28,6 +28,8 @@ CREATE TABLE IF NOT EXISTS job_runs (
     mode            TEXT NOT NULL,
     status          TEXT NOT NULL,
     title           TEXT,
+    description     TEXT,
+    tags            TEXT,
     suggested_price REAL,
     listing_id      TEXT,
     pdf_path        TEXT,
@@ -36,6 +38,15 @@ CREATE TABLE IF NOT EXISTS job_runs (
     created_at      INTEGER NOT NULL
 );
 """
+
+# Columns added to an existing database after its table was first created.
+# ``CREATE TABLE IF NOT EXISTS`` will not add them, so ALTER TABLE is used.
+_COLUMN_MIGRATIONS = {
+    "job_runs": {
+        "description": "ALTER TABLE job_runs ADD COLUMN description TEXT",
+        "tags": "ALTER TABLE job_runs ADD COLUMN tags TEXT",
+    },
+}
 
 
 class ListingDatabase:
@@ -54,6 +65,20 @@ class ListingDatabase:
     def _init_schema(self) -> None:
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
+            self._migrate_columns(conn)
+            conn.commit()
+
+    def _migrate_columns(self, conn: sqlite3.Connection) -> None:
+        """Add columns introduced after a table's first creation."""
+        for table, migrations in _COLUMN_MIGRATIONS.items():
+            existing = {
+                row["name"]
+                for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            for column, statement in migrations.items():
+                if column not in existing:
+                    conn.execute(statement)
+                    logger.info("Migration: added column %s.%s", table, column)
 
     def is_keyword_processed(self, keyword: str) -> bool:
         """Return True if *keyword* was targeted within the last 60 days.
@@ -134,6 +159,8 @@ class ListingDatabase:
         status: str,
         *,
         title: str = "",
+        description: str = "",
+        tags: list[str] | None = None,
         suggested_price: float | None = None,
         listing_id: str | None = None,
         pdf_path: str = "",
@@ -142,21 +169,28 @@ class ListingDatabase:
     ) -> int:
         """Record a pipeline execution (dry-run or live) for audit/debugging.
 
-        Stored in the separate ``job_runs`` table so dry-runs never affect the
-        ``processed_listings`` dedup window for real uploads. Returns row id.
+        Persists the full listing copy (title, description, tags, price)
+        alongside the run metadata. Stored in the separate ``job_runs`` table
+        so dry-runs never affect the ``processed_listings`` dedup window for
+        real uploads. Returns row id.
         """
         created_at = int(time.time())
+        tags_json = json.dumps(tags or [], ensure_ascii=False)
+
         with self._connect() as conn:
             cursor = conn.execute(
                 "INSERT INTO job_runs "
-                "(keyword, mode, status, title, suggested_price, listing_id, "
-                " pdf_path, image_path, error, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "(keyword, mode, status, title, description, tags, "
+                " suggested_price, listing_id, pdf_path, image_path, error, "
+                " created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     keyword.strip().lower(),
                     mode,
                     status,
                     title,
+                    description,
+                    tags_json,
                     suggested_price,
                     listing_id,
                     pdf_path,
@@ -178,12 +212,23 @@ class ListingDatabase:
         """Return the most recent pipeline job runs, newest first."""
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT id, keyword, mode, status, title, suggested_price, "
-                "listing_id, pdf_path, image_path, error, created_at "
+                "SELECT id, keyword, mode, status, title, description, tags, "
+                "suggested_price, listing_id, pdf_path, image_path, error, "
+                "created_at "
                 "FROM job_runs ORDER BY id DESC LIMIT ?",
                 (limit,),
             ).fetchall()
-        return [dict(row) for row in rows]
+
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["description"] = item.get("description") or ""
+            try:
+                item["tags"] = json.loads(item.get("tags") or "[]")
+            except (json.JSONDecodeError, TypeError):
+                item["tags"] = []
+            result.append(item)
+        return result
 
 
 _db: ListingDatabase | None = None
@@ -219,6 +264,8 @@ def log_job_run(
     status: str,
     *,
     title: str = "",
+    description: str = "",
+    tags: list[str] | None = None,
     suggested_price: float | None = None,
     listing_id: str | None = None,
     pdf_path: str = "",
@@ -230,6 +277,8 @@ def log_job_run(
         mode,
         status,
         title=title,
+        description=description,
+        tags=tags,
         suggested_price=suggested_price,
         listing_id=listing_id,
         pdf_path=pdf_path,

@@ -203,11 +203,25 @@ class TagValidationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             EtsyListingData.model_validate(data)
 
-    def test_rejects_tag_longer_than_20_chars(self) -> None:
+    def test_overlong_tag_is_shortened_at_word_border(self) -> None:
         data = _valid_listing()
         data["tags"][0] = "this tag is way too long for etsy"
-        with self.assertRaises(ValueError):
-            EtsyListingData.model_validate(data)
+        listing = EtsyListingData.model_validate(data)
+        longest = listing.tags[0]
+        self.assertLessEqual(len(longest), 20)
+        # Whole words only: "too" is the last complete word that fits.
+        self.assertEqual(longest, "this tag is way too")
+        self.assertEqual(len(listing.tags), 13)
+
+    def test_single_overlong_word_hard_cuts_within_limit(self) -> None:
+        from src.content_generator import _truncate_at_word
+
+        self.assertEqual(_truncate_at_word("abcdefghijklmnopqrstuvwxyz", 20), "abcdefghijklmnopqrst")
+        self.assertEqual(
+            _truncate_at_word("digital daily planner", 20), "digital daily"
+        )
+        self.assertEqual(_truncate_at_word("short", 20), "short")
+        self.assertEqual(_truncate_at_word("planner pages template", 20), "planner pages")
 
     def test_rejects_duplicate_tags(self) -> None:
         data = _valid_listing()
@@ -392,6 +406,10 @@ class PipelineDryRunTests(unittest.TestCase):
         self.assertEqual(mock_job.call_args.args[1], "dry-run")
         self.assertEqual(mock_job.call_args.args[2], "completed")
         self.assertEqual(mock_job.call_args.kwargs["title"], _valid_listing()["title"])
+        self.assertEqual(
+            mock_job.call_args.kwargs["description"], _valid_listing()["description"]
+        )
+        self.assertEqual(mock_job.call_args.kwargs["tags"], _valid_listing()["tags"])
 
         self.assertIsNone(result["listing_id"])
         self.assertIsNone(result["review_url"])
@@ -437,6 +455,10 @@ class PipelineDryRunTests(unittest.TestCase):
         self.assertEqual(mock_job.call_args.args[1], "dry-run")
         self.assertEqual(mock_job.call_args.args[2], "completed")
         self.assertEqual(mock_job.call_args.kwargs["title"], _valid_listing()["title"])
+        self.assertEqual(
+            mock_job.call_args.kwargs["description"], _valid_listing()["description"]
+        )
+        self.assertEqual(mock_job.call_args.kwargs["tags"], _valid_listing()["tags"])
         self.assertIsNone(result["listing_id"])
         self.assertIsNone(result["review_url"])
         self.assertTrue(Path(result["pdf_path"]).exists())
@@ -506,11 +528,15 @@ class DatabaseJobRunTests(unittest.TestCase):
         self.db = ListingDatabase(Path(self._tmp.name) / "test.db")
 
     def test_log_job_run_and_list(self) -> None:
+        description = "## What You Get\nA daily planner for 2026.\n\nAI-assisted design."
+        tags = ["digital planner", "daily planner", "2026 planner", "pdf planner"]
         rid = self.db.log_job_run(
             "digital planner",
             "dry-run",
             "completed",
             title="Digital Daily Planner",
+            description=description,
+            tags=tags,
             suggested_price=4.99,
             pdf_path="out/product.pdf",
             image_path="out/product.png",
@@ -523,8 +549,56 @@ class DatabaseJobRunTests(unittest.TestCase):
         self.assertEqual(run["mode"], "dry-run")
         self.assertEqual(run["status"], "completed")
         self.assertEqual(run["title"], "Digital Daily Planner")
+        self.assertEqual(run["description"], description)
+        self.assertEqual(run["tags"], tags)
         self.assertAlmostEqual(run["suggested_price"], 4.99)
         self.assertTrue(run["pdf_path"].endswith("product.pdf"))
+
+    def test_empty_tags_round_trip_as_empty_list(self) -> None:
+        self.db.log_job_run("planner", "dry-run", "completed", title="D")
+        rows = self.db.list_job_runs(10)
+        self.assertEqual(rows[0]["tags"], [])
+        self.assertEqual(rows[0]["description"], "")
+
+    def test_migration_adds_description_and_tags_columns(self) -> None:
+        """Pre-existing job_runs tables must gain the new columns via ALTER."""
+        db_path = Path(self._tmp.name) / "legacy.db"
+        import sqlite3
+
+        legacy = sqlite3.connect(db_path)
+        legacy.executescript(
+            "CREATE TABLE IF NOT EXISTS job_runs ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT, keyword TEXT NOT NULL,"
+            " mode TEXT NOT NULL, status TEXT NOT NULL, title TEXT,"
+            " suggested_price REAL, listing_id TEXT, pdf_path TEXT,"
+            " image_path TEXT, error TEXT, created_at INTEGER NOT NULL);"
+        )
+        legacy.execute(
+            "INSERT INTO job_runs (keyword, mode, status, created_at)"
+            " VALUES ('old', 'dry-run', 'completed', 1)"
+        )
+        legacy.commit()
+        legacy.close()
+
+        migrated = ListingDatabase(db_path)
+        rid = migrated.log_job_run(
+            "new planner",
+            "dry-run",
+            "completed",
+            title="New",
+            description="Fresh copy.",
+            tags=["planner"],
+            suggested_price=3.99,
+        )
+        self.assertGreater(rid, 0)
+
+        rows = migrated.list_job_runs(10)
+        old = [r for r in rows if r["keyword"] == "old"]
+        new = [r for r in rows if r["keyword"] == "new planner"]
+        self.assertEqual(old[0]["description"], "")
+        self.assertEqual(old[0]["tags"], [])
+        self.assertEqual(new[0]["description"], "Fresh copy.")
+        self.assertEqual(new[0]["tags"], ["planner"])
 
     def test_failed_job_records_error(self) -> None:
         self.db.log_job_run("planner", "dry-run", "failed", error="ValueError: boom")
