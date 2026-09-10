@@ -20,7 +20,7 @@ from src.trend_analyzer import fetch_rising_trends, fetch_etsy_autocomplete
 from src.content_generator import generate_etsy_listing_data
 from src.asset_builder import AssetBuilder
 from src.etsy_client import EtsyClient, EtsyAPIError, MissingCredentialsError
-from src.database import is_keyword_processed, log_listing
+from src.database import is_keyword_processed, log_listing, log_job_run
 
 logger = logging.getLogger(__name__)
 
@@ -200,7 +200,8 @@ def run(
 ) -> dict:
     """Run the full pipeline and return a summary dict.
 
-    - dry_run=True (or missing credentials) -> assets only, no Etsy calls.
+    - dry_run=True (or missing/invalid credentials) -> assets only, no Etsy
+      calls; the run is recorded in the local SQLite ``job_runs`` table.
     - dry_run=False with valid credentials -> full flow up to Etsy draft.
 
     When *argv* is provided (CLI invocation) the parsed flags override the
@@ -221,38 +222,62 @@ def run(
     settings = get_settings()
     builder = AssetBuilder()
 
-    # 1. Research: expand the seed into keywords
-    seed_keywords = _seed_keywords(seed)
-    print(f"[1/5] Researching Google Trends for: {seed}")
-    trends = fetch_rising_trends(
-        seed_keywords,
-        geo=parsed_args.geo if parsed_args else "US",
-        timeframe=parsed_args.timeframe if parsed_args else "now 7-d",
-    )
-    print(f"      Found {len(trends)} rising related queries.")
+    # Mode decision up-front so dry-run stays local and stable even when Etsy
+    # tokens are absent or fail a live check.
+    is_dry = dry_run or (parsed_args.dry_run if parsed_args is not None else False)
+    should_upload = (not is_dry) and validate_etsy_credentials()
+    validation_failed = False
+    if should_upload:
+        client = EtsyClient()
+        if not client.verify_credentials():
+            should_upload = False
+            validation_failed = True
 
-    # 2. Select the single best opportunity (Trends + Etsy buyer-intent)
-    max_topics = parsed_args.max_topics if parsed_args else 5
-    print("[2/5] Selecting top opportunity and validating on Etsy...")
-    selected_topic = _pick_topic(trends, seed, max_topics)
-    print(f"      Selected: {selected_topic}")
+    run_mode = "live" if should_upload else "dry-run"
+    run_keyword = seed
 
-    # 3. Generate SEO listing data + product outline
-    print("[3/5] Generating SEO listing data (Groq, fallback NVIDIA NIM)...")
-    listing = generate_etsy_listing_data(selected_topic)
-    print(f"      Title: {listing['title']}")
+    try:
+        # 1. Research: expand the seed into keywords
+        seed_keywords = _seed_keywords(seed)
+        print(f"[1/5] Researching Google Trends for: {seed}")
+        trends = fetch_rising_trends(
+            seed_keywords,
+            geo=parsed_args.geo if parsed_args else "US",
+            timeframe=parsed_args.timeframe if parsed_args else "now 7-d",
+        )
+        print(f"      Found {len(trends)} rising related queries.")
 
-    # 4. Compile product asset + marketing mockup (always local)
-    print("[4/5] Compiling product PDF and marketing mockup...")
-    safe = seed.replace(" ", "_")
-    pdf_path = builder.compile_product_pdf(
-        _build_outline(listing), f"{safe}_product.pdf", output_dir=output_dir
-    )
-    image_path = builder.create_listing_image(
-        listing["title"],
-        f"{safe}_listing.png",
-        output_dir=output_dir,
-    )
+        # 2. Select the single best opportunity (Trends + Etsy buyer-intent)
+        max_topics = parsed_args.max_topics if parsed_args else 5
+        print("[2/5] Selecting top opportunity and validating on Etsy...")
+        selected_topic = _pick_topic(trends, seed, max_topics)
+        run_keyword = selected_topic
+        print(f"      Selected: {selected_topic}")
+
+        # 3. Generate SEO listing data + product outline
+        print("[3/5] Generating SEO listing data (Groq, fallback NVIDIA NIM)...")
+        listing = generate_etsy_listing_data(selected_topic)
+        print(f"      Title: {listing['title']}")
+
+        # 4. Compile product asset + marketing mockup (always local)
+        print("[4/5] Compiling product PDF and marketing mockup...")
+        safe = seed.replace(" ", "_")
+        pdf_path = builder.compile_product_pdf(
+            _build_outline(listing), f"{safe}_product.pdf", output_dir=output_dir
+        )
+        image_path = builder.create_listing_image(
+            listing["title"],
+            f"{safe}_listing.png",
+            output_dir=output_dir,
+        )
+    except Exception as exc:
+        log_job_run(
+            run_keyword,
+            run_mode,
+            "failed",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        raise
 
     base = {
         "topic": selected_topic,
@@ -265,61 +290,77 @@ def run(
         "review_url": None,
     }
 
-    # 5. Decide whether to hit the Etsy API.
-    is_dry = dry_run or (
-        parsed_args.dry_run if parsed_args is not None else False
-    )
-    should_upload = (not is_dry) and validate_etsy_credentials()
-    validation_failed = False
-
-    # Credentials being *present* is not enough: probe the API so a stale
-    # token or a placeholder/invalid shop id degrades to dry-run instead of
-    # crashing the scheduler run.
-    if should_upload:
-        client = EtsyClient()
-        if not client.verify_credentials():
-            should_upload = False
-            validation_failed = True
-
     if not should_upload:
         print(
             "\n[DRY RUN] Etsy API skipped"
             + ("; credentials failed validation" if validation_failed else "")
             + "; assets generated locally."
         )
+        log_job_run(
+            run_keyword,
+            run_mode,
+            "completed",
+            title=listing["title"],
+            suggested_price=listing["suggested_price"],
+            pdf_path=str(pdf_path),
+            image_path=str(image_path),
+        )
+        print("      Job recorded in local database (job_runs).")
         _print_summary({**base, "tags_count": len(listing["tags"]), "dry_run": True})
         _emit_result(base)
         return base
 
-    # 6. Upload as a DRAFT (mockup + product file), never publish.
-    print("[5/5] Creating Etsy draft listing and uploading assets...")
-    client.require_credentials()
+    # 5. Upload as a DRAFT (mockup + product file), never publish.
+    try:
+        print("[5/5] Creating Etsy draft listing and uploading assets...")
+        client.require_credentials()
 
-    taxonomy_id = parsed_args.taxonomy_id if parsed_args else 2047
-    draft = client.create_draft_listing(
+        taxonomy_id = parsed_args.taxonomy_id if parsed_args else 2047
+        draft = client.create_draft_listing(
+            title=listing["title"],
+            description=listing["description"],
+            tags=listing["tags"],
+            price=listing["suggested_price"],
+            taxonomy_id=taxonomy_id,
+        )
+        listing_id = draft["listing_id"]
+        print(f"      Draft listing created: {listing_id}")
+
+        client.upload_listing_image(listing_id, str(image_path))
+        print("      Mockup image uploaded.")
+
+        client.upload_digital_file(listing_id, str(pdf_path))
+        print("      Product PDF uploaded.")
+
+        log_listing(
+            keyword=selected_topic,
+            listing_id=str(listing_id),
+            status="draft",
+            pdf_path=str(pdf_path),
+            tags=listing["tags"],
+        )
+        print("      Processing logged to database.")
+    except Exception as exc:
+        log_job_run(
+            run_keyword,
+            run_mode,
+            "failed",
+            title=listing["title"],
+            suggested_price=listing["suggested_price"],
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        raise
+
+    log_job_run(
+        run_keyword,
+        run_mode,
+        "completed",
         title=listing["title"],
-        description=listing["description"],
-        tags=listing["tags"],
-        price=listing["suggested_price"],
-        taxonomy_id=taxonomy_id,
-    )
-    listing_id = draft["listing_id"]
-    print(f"      Draft listing created: {listing_id}")
-
-    client.upload_listing_image(listing_id, str(image_path))
-    print("      Mockup image uploaded.")
-
-    client.upload_digital_file(listing_id, str(pdf_path))
-    print("      Product PDF uploaded.")
-
-    log_listing(
-        keyword=selected_topic,
+        suggested_price=listing["suggested_price"],
         listing_id=str(listing_id),
-        status="draft",
         pdf_path=str(pdf_path),
-        tags=listing["tags"],
+        image_path=str(image_path),
     )
-    print("      Processing logged to database.")
 
     result = {
         **base,

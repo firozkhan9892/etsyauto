@@ -104,9 +104,13 @@ Given a single topic keyword, produce a complete Etsy listing draft as JSON.
 Rules:
 - title: under 140 characters, leading with the highest-intent keyword,
   secondary keywords separated by commas.
+- The CURRENT year is {current_year}. Whenever a title or description
+  references a year, use {current_year} (or "2026" style wording). NEVER use
+  past or future years such as 2024, 2025, or 2027.
 - tags: EXACTLY 13 tags, each under 20 characters, lowercase, unique.
   Use natural phrases with spaces between words (e.g. "digital planner"),
-  no punctuation or symbols.
+  no punctuation or symbols. If any tag exceeds 20 characters, rephrase or
+  shorten it so every tag passes validation.
 - description: Markdown. Sections: ## What You Get, ## How to Download,
   ## Disclaimer. The ## Disclaimer section MUST contain the exact phrase
   "AI-assisted design" (e.g. "This product was created with AI-assisted
@@ -122,12 +126,17 @@ Rules:
 
 
 def _build_user_prompt(topic_keyword: str) -> str:
+    current_year = time.localtime().tm_year
     return (
         f"Create a full Etsy listing draft for this digital product topic: "
         f"'{topic_keyword}'.\n\n"
         "Think step-by-step about buyer intent, pricing, and SEO before "
         "returning the final JSON.\n\n"
         "REMINDERS:\n"
+        f"- The current year is {current_year}. Use only {current_year} in "
+        "any dates/years in the title and description.\n"
+        "- Every tag MUST be at most 20 characters; shorten any tag that "
+        "would be longer.\n"
         "- The description MUST contain a '## Disclaimer' section that "
         "includes the exact phrase 'AI-assisted design'.\n"
         "- Output ONLY valid JSON: keys are title, tags, description, "

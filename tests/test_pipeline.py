@@ -23,6 +23,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.asset_builder import AssetBuilder
 from src.content_generator import EtsyListingData, generate_etsy_listing_data
+from src.database import ListingDatabase
 from src.etsy_client import EtsyClient
 from src.trend_analyzer import fetch_rising_trends, fetch_etsy_autocomplete
 
@@ -369,7 +370,9 @@ class PipelineDryRunTests(unittest.TestCase):
             pipeline.EtsyClient, "upload_digital_file"
         ) as mock_file, patch.object(
             pipeline, "log_listing"
-        ) as mock_log:
+        ) as mock_log, patch.object(
+            pipeline, "log_job_run"
+        ) as mock_job:
             result = pipeline.run(
                 seed="planner", dry_run=True, output_dir=str(self.tmp_path)
             )
@@ -380,11 +383,15 @@ class PipelineDryRunTests(unittest.TestCase):
         self.assertIsNotNone(result["image_path"])
         self.assertTrue(Path(result["image_path"]).exists())
 
-        # No Etsy write calls and no DB logging in dry-run.
+        # No Etsy write calls; the dry-run job IS audited in job_runs.
         mock_create.assert_not_called()
         mock_img.assert_not_called()
         mock_file.assert_not_called()
         mock_log.assert_not_called()
+        mock_job.assert_called_once()
+        self.assertEqual(mock_job.call_args.args[1], "dry-run")
+        self.assertEqual(mock_job.call_args.args[2], "completed")
+        self.assertEqual(mock_job.call_args.kwargs["title"], _valid_listing()["title"])
 
         self.assertIsNone(result["listing_id"])
         self.assertIsNone(result["review_url"])
@@ -415,7 +422,9 @@ class PipelineDryRunTests(unittest.TestCase):
             pipeline.EtsyClient, "upload_digital_file"
         ) as mock_file, patch.object(
             pipeline, "log_listing"
-        ) as mock_log:
+        ) as mock_log, patch.object(
+            pipeline, "log_job_run"
+        ) as mock_job:
             result = pipeline.run(seed="planner", dry_run=False, output_dir=str(self.tmp_path))
 
         # Live validation ran, uploads never happened, result is dry-run style.
@@ -424,6 +433,10 @@ class PipelineDryRunTests(unittest.TestCase):
         mock_img.assert_not_called()
         mock_file.assert_not_called()
         mock_log.assert_not_called()
+        mock_job.assert_called_once()
+        self.assertEqual(mock_job.call_args.args[1], "dry-run")
+        self.assertEqual(mock_job.call_args.args[2], "completed")
+        self.assertEqual(mock_job.call_args.kwargs["title"], _valid_listing()["title"])
         self.assertIsNone(result["listing_id"])
         self.assertIsNone(result["review_url"])
         self.assertTrue(Path(result["pdf_path"]).exists())
@@ -482,6 +495,61 @@ class ValidateCredentialsTests(unittest.TestCase):
 
         self._reset_settings()
         self.assertFalse(pipeline.validate_etsy_credentials())
+
+
+class DatabaseJobRunTests(unittest.TestCase):
+    """Audit table must not leak into the processed_keywords dedup window."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.db = ListingDatabase(Path(self._tmp.name) / "test.db")
+
+    def test_log_job_run_and_list(self) -> None:
+        rid = self.db.log_job_run(
+            "digital planner",
+            "dry-run",
+            "completed",
+            title="Digital Daily Planner",
+            suggested_price=4.99,
+            pdf_path="out/product.pdf",
+            image_path="out/product.png",
+        )
+        self.assertGreater(rid, 0)
+
+        rows = self.db.list_job_runs(10)
+        self.assertEqual(len(rows), 1)
+        run = rows[0]
+        self.assertEqual(run["mode"], "dry-run")
+        self.assertEqual(run["status"], "completed")
+        self.assertEqual(run["title"], "Digital Daily Planner")
+        self.assertAlmostEqual(run["suggested_price"], 4.99)
+        self.assertTrue(run["pdf_path"].endswith("product.pdf"))
+
+    def test_failed_job_records_error(self) -> None:
+        self.db.log_job_run("planner", "dry-run", "failed", error="ValueError: boom")
+        rows = self.db.list_job_runs(10)
+        self.assertEqual(rows[0]["status"], "failed")
+        self.assertIn("boom", rows[0]["error"])
+
+    def test_dry_run_jobs_do_not_mark_keyword_processed(self) -> None:
+        self.db.log_job_run("budget tracker", "dry-run", "completed", title="Budget Tracker")
+        self.assertFalse(self.db.is_keyword_processed("budget tracker"))
+
+        # A real draft still marks it processed for dedup.
+        self.db.log_listing(
+            "budget tracker", "9999", "draft", "p.pdf",
+            ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m"],
+        )
+        self.assertTrue(self.db.is_keyword_processed("budget tracker"))
+
+    def test_live_job_can_be_distinguished_from_dry_run(self) -> None:
+        self.db.log_job_run("planner", "dry-run", "completed", title="D")
+        self.db.log_job_run("planner", "live", "completed", listing_id="777", title="D")
+        rows = self.db.list_job_runs(10)
+        modes = [r["mode"] for r in rows]
+        self.assertEqual(modes, ["live", "dry-run"])
+        self.assertEqual(rows[0]["listing_id"], "777")
 
 
 if __name__ == "__main__":

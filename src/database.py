@@ -22,6 +22,19 @@ CREATE TABLE IF NOT EXISTS processed_listings (
     pdf_path   TEXT,
     tags       TEXT
 );
+CREATE TABLE IF NOT EXISTS job_runs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    keyword         TEXT NOT NULL,
+    mode            TEXT NOT NULL,
+    status          TEXT NOT NULL,
+    title           TEXT,
+    suggested_price REAL,
+    listing_id      TEXT,
+    pdf_path        TEXT,
+    image_path      TEXT,
+    error           TEXT,
+    created_at      INTEGER NOT NULL
+);
 """
 
 
@@ -40,8 +53,7 @@ class ListingDatabase:
 
     def _init_schema(self) -> None:
         with self._connect() as conn:
-            conn.execute(_SCHEMA)
-            conn.commit()
+            conn.executescript(_SCHEMA)
 
     def is_keyword_processed(self, keyword: str) -> bool:
         """Return True if *keyword* was targeted within the last 60 days.
@@ -115,6 +127,64 @@ class ListingDatabase:
             result.append(item)
         return result
 
+    def log_job_run(
+        self,
+        keyword: str,
+        mode: str,
+        status: str,
+        *,
+        title: str = "",
+        suggested_price: float | None = None,
+        listing_id: str | None = None,
+        pdf_path: str = "",
+        image_path: str = "",
+        error: str = "",
+    ) -> int:
+        """Record a pipeline execution (dry-run or live) for audit/debugging.
+
+        Stored in the separate ``job_runs`` table so dry-runs never affect the
+        ``processed_listings`` dedup window for real uploads. Returns row id.
+        """
+        created_at = int(time.time())
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "INSERT INTO job_runs "
+                "(keyword, mode, status, title, suggested_price, listing_id, "
+                " pdf_path, image_path, error, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    keyword.strip().lower(),
+                    mode,
+                    status,
+                    title,
+                    suggested_price,
+                    listing_id,
+                    pdf_path,
+                    image_path,
+                    error,
+                    created_at,
+                ),
+            )
+            conn.commit()
+            row_id = int(cursor.lastrowid)
+
+        logger.info(
+            "Logged job run id=%s keyword=%r mode=%s status=%s",
+            row_id, keyword, mode, status,
+        )
+        return row_id
+
+    def list_job_runs(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Return the most recent pipeline job runs, newest first."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, keyword, mode, status, title, suggested_price, "
+                "listing_id, pdf_path, image_path, error, created_at "
+                "FROM job_runs ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
 
 _db: ListingDatabase | None = None
 
@@ -141,3 +211,32 @@ def log_listing(
     tags: list[str],
 ) -> int:
     return get_db().log_listing(keyword, listing_id, status, pdf_path, tags)
+
+
+def log_job_run(
+    keyword: str,
+    mode: str,
+    status: str,
+    *,
+    title: str = "",
+    suggested_price: float | None = None,
+    listing_id: str | None = None,
+    pdf_path: str = "",
+    image_path: str = "",
+    error: str = "",
+) -> int:
+    return get_db().log_job_run(
+        keyword,
+        mode,
+        status,
+        title=title,
+        suggested_price=suggested_price,
+        listing_id=listing_id,
+        pdf_path=pdf_path,
+        image_path=image_path,
+        error=error,
+    )
+
+
+def list_job_runs(limit: int = 50) -> list[dict[str, Any]]:
+    return get_db().list_job_runs(limit)
